@@ -1,4 +1,5 @@
 #![recursion_limit = "2048"]
+mod delay;
 mod publisher;
 mod record_client;
 mod resolver;
@@ -90,6 +91,13 @@ enum Opt {
         #[structopt(flatten)]
         params: container::Params,
     },
+    #[structopt(name = "delay", about = "delayed views of data")]
+    Delay {
+        #[structopt(flatten)]
+        common: ClientParams,
+        #[structopt(flatten)]
+        params: delay::Params,
+    },
     #[cfg(unix)]
     #[structopt(name = "record", about = "record and republish archives")]
     Record {
@@ -156,6 +164,10 @@ async fn tokio_main() -> Result<()> {
         Opt::Container { common, params } => {
             let (cfg, auth) = common.load();
             container::run(cfg, auth, params).await
+        }
+        Opt::Delay { common, params } => {
+            let (cfg, auth) = common.load();
+            delay::run(cfg, auth, params).await
         }
         Opt::RecordClient { cmd } => record_client::run(cmd).await,
         #[cfg(unix)]
