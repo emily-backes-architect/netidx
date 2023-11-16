@@ -1,4 +1,3 @@
-use bytes::Bytes;
 use anyhow::{Context, Result};
 use arcstr::ArcStr;
 use futures::{
@@ -13,20 +12,16 @@ use netidx::{
 use netidx::{
     config::Config,
     path::Path,
-    pool::Pooled,
+    pool::{Pool, Pooled},
     resolver_client::DesiredAuth,
     subscriber::{Dval, Event, SubId, Subscriber, UpdatesFlags},
     utils::{BatchItem, Batched},
 };
 use serde_derive::{Deserialize, Serialize};
-use std::{
-    collections::HashMap,
-    iter,
-    path::PathBuf,
-    time::{Duration, Instant},
-};
+use std::{collections::HashMap, iter, path::PathBuf, time::Duration};
 use structopt::StructOpt;
 use tokio::time;
+use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DelayConfig {
@@ -44,14 +39,8 @@ impl DelayConfig {
 
     /// Provide an example JSON configuration
     pub fn example() -> String {
-        let mut hm: HashMap<String, Vec<Path>> = HashMap::new();
-        hm.insert(
-            "10s".to_string(),
-            vec!["/foo/**", "/time/**"]
-                .into_iter()
-                .map(|x| Into::<Path>::into(x))
-                .collect(),
-        );
+        let mut hm: HashMap<String, Vec<String>> = HashMap::new();
+        hm.insert("10s".to_string(), vec!["/foo/**".to_string(), "/time/**".to_string()]);
         serde_json::to_string(&DelayConfig { delay: hm })
             .expect("internal example config")
     }
@@ -86,8 +75,8 @@ struct Ctx {
     globset: GlobSet,
     global_base: Path,
     sender_updates: Sender<Pooled<Vec<(SubId, Event)>>>,
-    paths: HashMap<SubId, Path>,
-    subscriptions: HashMap<Path, Dval>,
+    paths_by_id: HashMap<SubId, Path>,
+    dval_by_path: HashMap<Path, Dval>,
     subscriber: Subscriber,
     updates: Batched<Receiver<Pooled<Vec<(SubId, Event)>>>>,
 }
@@ -100,6 +89,13 @@ fn parse_duration(s: &str) -> Result<Duration> {
     }
 }
 
+#[derive(Debug)]
+struct ResolverChecker {
+    task: tokio::task::JoinHandle<Result<(), anyhow::Error>>,
+    cancel: CancellationToken,
+    new_paths: Receiver<Pooled<Vec<Path>>>,
+}
+
 impl Ctx {
     async fn new(
         config: Config,
@@ -110,20 +106,20 @@ impl Ctx {
         let (sender_updates, updates) = mpsc::channel(100);
         let delay_config = DelayConfig::load(p.delay_config).await?;
         let mut globsets: HashMap<Duration, GlobSet> = HashMap::new();
-        let mut all_paths = Vec::with_capacity(delay_config.delay.values().map(|p|p.len()).sum());
+        let mut all_paths =
+            Vec::with_capacity(delay_config.delay.values().map(|p| p.len()).sum());
         let mut ct_by_path = HashMap::new();
         for (delay, paths) in &delay_config.delay {
             let dur = parse_duration(&*delay)?;
             let mut delay_paths: Vec<Glob> = Vec::with_capacity(paths.len());
             for p in paths {
-                let glob =
-                    if Glob::is_glob(&p) {
-                        Glob::new(Chars::from(String::from(&*p)))?
-                    } else {
-                        let mut p = p.clone();
-                        p.push('*');
-                        Glob::new(Chars::from(String::from(&*p)))?
-                    };
+                let glob = if Glob::is_glob(&p) {
+                    Glob::new(Chars::from(String::from(&*p)))?
+                } else {
+                    let mut p = p.clone();
+                    p.push('*');
+                    Glob::new(Chars::from(String::from(&*p)))?
+                };
                 delay_paths.push(glob.clone());
                 all_paths.push(glob.clone());
                 let path_for_ct = Path::from(ArcStr::from(glob.base()));
@@ -131,7 +127,9 @@ impl Ctx {
             }
             globsets.insert(dur, GlobSet::new(false, delay_paths.into_iter())?);
         }
-        let global_base = Path::from(ArcStr::from(all_paths.iter().map(|g|g.base().clone()).fold("/", |a, b| Path::lcp(a, b))));
+        let global_base = Path::from(ArcStr::from(
+            all_paths.iter().map(|g| g.base().clone()).fold("/", |a, b| Path::lcp(a, b)),
+        ));
         Ok(Ctx {
             config,
             auth,
@@ -140,46 +138,64 @@ impl Ctx {
             globset: GlobSet::new(false, all_paths)?,
             global_base,
             sender_updates,
-            paths: HashMap::new(),
+            paths_by_id: HashMap::new(),
             subscriber,
-            subscriptions: HashMap::new(),
+            dval_by_path: HashMap::new(),
             updates: Batched::new(updates, 100_000),
         })
     }
 
-    async fn check_resolver(&mut self) -> Result<()> {
+    /// Return a cancellable task that checks the resolver for new publishers.
+    async fn check_resolver(self) -> Result<ResolverChecker, anyhow::Error> {
+        let (mut resolver_update_send, resolver_updates): (
+            Sender<Pooled<Vec<Path>>>,
+            Receiver<Pooled<Vec<Path>>>,
+        ) = mpsc::channel(10);
         let resolver = ResolverRead::new(self.config, self.auth);
-
+        let canceller = CancellationToken::new();
+        let cloned_token = canceller.clone();
+        let pool: Pool<Vec<Path>> = Pool::new(100, 10 * 1024);
         let mut ct = ChangeTracker::new(self.global_base);
-
-        loop {
-            if resolver.check_changed(&mut ct).await.context("check changed")? {
-                for b in resolver.list_matching(&self.globset).await.unwrap().iter() {
-                    for p in b.iter() {
-                        
-                    }
-                }
-            } else {
-                time(sleep(Duration::from_secs(5))).await;
-            }
-        }
-        let globs = GlobSet::new(no_structure, iter::once(glob)).unwrap();
-        let mut paths = HashSet::new();
-
-        loop {
-            if resolver.check_changed(&mut ct).await.context("check changed")? {
-                for b in resolver.list_matching(&globs).await.unwrap().iter() {
-                    for p in b.iter() {
-                        if !paths.contains(p) {
-                            paths.insert(p.clone());
-                            println!("{}", p);
+        let resolver_checker: tokio::task::JoinHandle<std::result::Result<(), _>> =
+            tokio::spawn(async move {
+                loop {
+                    let mut to_add: Pooled<Vec<Path>> = pool.take();
+                    if resolver
+                        .check_changed(&mut ct)
+                        .await
+                        .context("check resolver for new paths")?
+                    {
+                        for b in
+                            resolver.list_matching(&self.globset).await.unwrap().iter()
+                        {
+                            for p in b.iter() {
+                                if !self.dval_by_path.contains_key(p) {
+                                    to_add.push((*p).clone());
+                                }
+                            }
                         }
                     }
+                    // Halt the checker if subscriber dies
+                    if let Err(_) = resolver_update_send.try_send(to_add) {
+                        break;
+                    }
+                    // Halt if cancelled, otherwise wait and recheck resolver
+                    tokio::select! {
+                        _ = cloned_token.cancelled() => {
+                            break;
+                        }
+                        _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+                    }
                 }
-            }
-            time::sleep(Duration::from_secs(5)).await
-        }
-        Ok(())
+                // Cancelled or subscriber lost, exit loop
+                resolver_update_send.close();
+                Ok(())
+            });
+        Ok(ResolverChecker {
+            task: resolver_checker,
+            cancel: canceller,
+            new_paths: resolver_updates,
+        })
     }
 
     fn remove_subscription(&mut self, path: &str) {
