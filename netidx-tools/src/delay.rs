@@ -67,7 +67,7 @@ pub(super) struct Params {
     pub(crate) delay_config: PathBuf,
 }
 
-struct Ctx {
+pub(crate) struct Ctx {
     config: Config,
     auth: DesiredAuth,
     delay_config: DelayConfig,
@@ -75,7 +75,8 @@ struct Ctx {
     globset: GlobSet,
     global_base: Path,
     sender_updates: Sender<Pooled<Vec<(SubId, Event)>>>,
-    paths_by_id: HashMap<SubId, Path>,
+    sub_by_path: HashMap<Path, SubId>,
+    paths_by_sub: HashMap<SubId, Path>,
     dval_by_path: HashMap<Path, Dval>,
     subscriber: Subscriber,
     updates: Batched<Receiver<Pooled<Vec<(SubId, Event)>>>>,
@@ -138,7 +139,8 @@ impl Ctx {
             globset: GlobSet::new(false, all_paths)?,
             global_base,
             sender_updates,
-            paths_by_id: HashMap::new(),
+            sub_by_path: HashMap::new(),
+            paths_by_sub: HashMap::new(),
             subscriber,
             dval_by_path: HashMap::new(),
             updates: Batched::new(updates, 100_000),
@@ -198,44 +200,32 @@ impl Ctx {
         })
     }
 
-    fn remove_subscription(&mut self, path: &str) {
-        if let Some(dv) = self.subscriptions.remove(path) {
-            self.subscribe_ts.remove(path);
-            self.paths.remove(&dv.id());
+    fn remove_subscription(&mut self, path: &Path) {
+        if let Some(sub) = self.sub_by_path.remove(path) {
+            self.paths_by_sub.remove(&sub);
         }
+        self.dval_by_path.remove(path);
     }
 
     fn add_subscription(&mut self, path: &Path) -> &Dval {
-        let subscriptions = &mut self.subscriptions;
-        let paths = &mut self.paths;
         let subscriber = &self.subscriber;
         let sender_updates = self.sender_updates.clone();
-        subscriptions.entry(path.clone()).or_insert_with(|| {
-            let s = subscriber.subscribe(path.clone());
-            paths.insert(s.id(), path.clone());
-            s.updates(
+        self.sub_by_path.entry(path.clone()).or_insert_with(|| {
+            let new_dval = subscriber.subscribe(path.clone());
+            self.paths_by_sub.insert(new_dval.id(), path.clone());
+            new_dval.updates(
                 UpdatesFlags::BEGIN_WITH_LAST | UpdatesFlags::STOP_COLLECTING_LAST,
                 sender_updates,
             );
-            s
-        })
+            self.dval_by_path.insert(path.clone(), new_dval);
+            new_dval.id()
+        });
+        self.dval_by_path.get(path).unwrap()
     }
 
     async fn check_timeouts(&mut self, timeout: Duration) -> Result<()> {
-        let mut failed = Vec::new();
-        for (path, started) in &self.subscribe_ts {
-            if started.elapsed() > timeout {
-                failed.push(path.clone())
-            }
-        }
-        for path in failed {
-            eprintln!(
-                "WARNING: subscription to {} did not succeed before timeout and will be canceled",
-                &path
-            );
-            self.remove_subscription(&path)
-        }
-        Ok(())
+        todo!();
+        // scan delayed batches from min heap
     }
 
     async fn process_update(
@@ -249,8 +239,6 @@ impl Ctx {
                 for (id, value) in batch.drain(..) {
                     if let Some(path) = self.paths.get(&id) {
                         todo!();
-                        // Out { raw: self.raw, path: &**path, value }
-                        //   .write(&mut self.to_stdout)?;
                     }
                 }
             }
@@ -259,8 +247,9 @@ impl Ctx {
 }
 
 pub(super) async fn run(cfg: Config, auth: DesiredAuth, p: Params) -> Result<()> {
-    let subscriber = Subscriber::new(cfg, auth).context("create subscriber")?;
-    let mut ctx = Ctx::new(cfg, subscriber, auth, p);
+    let subscriber =
+        Subscriber::new(cfg.clone(), auth.clone()).context("create subscriber")?;
+    let mut ctx = Ctx::new(cfg, subscriber, auth, p).await?;
     let mut tick = time::interval(Duration::from_secs(1));
     loop {
         select_biased! {
